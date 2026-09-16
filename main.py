@@ -3,12 +3,25 @@ import uuid
 from datetime import datetime, timezone
 from fastapi import FastAPI, Query, HTTPException
 from consenses import compute_risk_consensus
+from database import init_db, save_advisory_record, purge_expired_records
 
 app = FastAPI(
     title="Destination Risk Advisory API",
     version="1.0.0",
     description="Consensus-driven travel safety intelligence for autonomous agents."
 )
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
+@app.get("/")
+def read_root():
+    return {
+        "status": "online",
+        "service": "Destination Risk Advisory API",
+        "endpoints": ["/v1/travel/risk", "/v1/system/purge", "/docs"]
+    }
 
 @app.get("/v1/travel/risk")
 def get_travel_risk(
@@ -19,14 +32,11 @@ def get_travel_risk(
     country_code = country.upper()
     region_code = region.upper() if region else None
 
-    # 1. Execute consensus verification across providers
     try:
         consensus_result = compute_risk_consensus(country_code, region_code)
     except Exception as e:
-        # Propagate upstream system errors explicitly (Section 1.1)
         raise HTTPException(status_code=502, detail=f"Upstream provider failure: {str(e)}")
 
-    # 2. Build the primary data payload required by the catalog
     data_payload = {
         "country": consensus_result["country"],
         "region": consensus_result["region"],
@@ -36,10 +46,8 @@ def get_travel_risk(
         "sources_used": consensus_result["sources_used"]
     }
 
-    # 3. Calculate latency in milliseconds (< 200 ms target)
     latency_ms = int((time.perf_counter() - start_time) * 1000)
 
-    # 4. Wrap with the Universal Response Envelope (Section 3)
     meta_payload = {
         "request_id": f"req_{uuid.uuid4().hex[:16]}",
         "product_id": "travel.risk.advisory.v1",
@@ -71,7 +79,18 @@ def get_travel_risk(
         "warnings": consensus_result["warnings"]
     }
 
-    return {
-        "data": data_payload,
-        "meta": meta_payload
-    }
+    full_response = {"data": data_payload, "meta": meta_payload}
+
+    # Save to storage with 24h TTL
+    try:
+        save_advisory_record(country_code, region_code, full_response, ttl_seconds=86400)
+    except Exception as db_err:
+        full_response["meta"]["warnings"].append(f"Storage warning: {str(db_err)}")
+
+    return full_response
+
+@app.post("/v1/system/purge")
+def trigger_purge():
+    """Manual trigger to purge expired records (Section 1.3)."""
+    purged = purge_expired_records()
+    return {"status": "success", "purged_records": purged}
